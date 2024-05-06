@@ -16,10 +16,6 @@ repositories {
         url = "https://oss.sonatype.org/content/groups/public/"
     }
     maven {
-        name =  "essentialsx-releases"
-        url = "https://repo.essentialsx.net/releases/"
-    }
-    maven {
         name = "papermc"
         url = "https://papermc.io/repo/repository/maven-public/"
     }
@@ -33,8 +29,7 @@ repositories {
 }
 
 dependencies {
-    compileOnly "io.papermc.paper:paper-api:1.20.2-R0.1-SNAPSHOT"
-    compileOnly 'net.essentialsx:EssentialsX:2.19.0'
+    compileOnly 'io.papermc.paper:paper-api:1.20.4-R0.1-SNAPSHOT'
     compileOnly 'me.clip:placeholderapi:2.11.5'
 
     compileOnly('net.citizensnpcs:citizens-main:2.0.33-SNAPSHOT') {
@@ -42,20 +37,12 @@ dependencies {
     }
 }
 
-def targetJavaVersion = 17
 java {
-    def javaVersion = JavaVersion.toVersion(targetJavaVersion)
-    sourceCompatibility = javaVersion
-    targetCompatibility = javaVersion
-    if (JavaVersion.current() < javaVersion) {
-        toolchain.languageVersion = JavaLanguageVersion.of(targetJavaVersion)
-    }
+    toolchain.languageVersion.set(JavaLanguageVersion.of(17))
 }
 
-tasks.withType(JavaCompile).configureEach {
-    if (targetJavaVersion >= 10 || JavaVersion.current().isJava10Compatible()) {
-        options.release = targetJavaVersion
-    }
+jar {
+    destinationDirectory.set(file("server/plugins"))
 }
 
 processResources {
@@ -64,14 +51,5 @@ processResources {
     filteringCharset 'UTF-8'
     filesMatching('plugin.yml') {
         expand props
-    }
-}
-
-task copyJarToBin {
-    doLast {
-        copy {
-            from 'build/libs/Eventful-' + version + '.jar'
-            into 'E:/Documents 2/Servers/EventfulTest/plugins'
-        }
     }
 }
