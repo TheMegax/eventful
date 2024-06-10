@@ -3,20 +3,19 @@ package net.themegax.eventful;
 import net.citizensnpcs.api.CitizensAPI;
 import net.citizensnpcs.api.event.CitizensEnableEvent;
 import net.citizensnpcs.api.npc.NPC;
+import net.citizensnpcs.util.NMS;
 import net.themegax.eventful.Database.DatabaseManager;
+import org.apache.commons.lang3.StringUtils;
 import org.bukkit.Bukkit;
+import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.configuration.file.FileConfiguration;
-import org.bukkit.entity.Entity;
-import org.bukkit.entity.EntityType;
-import org.bukkit.entity.LivingEntity;
-import org.bukkit.entity.Player;
+import org.bukkit.entity.*;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.plugin.java.JavaPlugin;
 
-import java.util.Dictionary;
-import java.util.Hashtable;
+import java.util.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -29,8 +28,11 @@ public final class EventfulMain extends JavaPlugin {
     FileConfiguration config = getConfig();
 
     private static class PatrolProperties {
-        public float susLevel = 0;
+        public long lastAttackTimer = 0;
+        public long lastTimeSincePlayerWasSeen = 0;
+        public boolean isChasingPlayer = false;
         public Location lastKnownPlayerLocation = null;
+        public Location closestTargetLocation = null;
         public Location closestSoundLocation = null;
 
         public PatrolProperties() {}
@@ -82,18 +84,30 @@ public final class EventfulMain extends JavaPlugin {
         if (!isCitizensEnabled) return;
 
         for ( NPC npc : CitizensAPI.getNPCRegistry()) {
+            if (!npc.isSpawned()) continue;
             var npcEntity = (LivingEntity) npc.getEntity();
             if (npcEntity == null) continue;
 
             // We control NPCs with the "patrol" tag
             // If the NPC is not a villager, auto convert it to one
             if (!npcEntity.getScoreboardTags().contains("patrol")) continue;
-            if (npcEntity.getType() != EntityType.VILLAGER) {
+
+            if (npcEntity.getScoreboardTags().contains("guard")) {
+                if (npcEntity.getType() != EntityType.VINDICATOR) {
+                    npc.setBukkitEntityType(EntityType.VINDICATOR);
+                    npcEntity = (LivingEntity) npc.getEntity();
+                    npcEntity.addScoreboardTag("patrol");
+                    npcEntity.addScoreboardTag("guard");
+                }
+            }
+            else if (npcEntity.getType() != EntityType.VILLAGER) {
                 npc.setBukkitEntityType(EntityType.VILLAGER);
                 npcEntity = (LivingEntity) npc.getEntity();
                 npcEntity.addScoreboardTag("patrol");
             }
-            npcEntity.setSilent(true); // Just so we don't have to deal with random villager sounds
+
+            // Traits
+            npcEntity.setSilent(true);
 
             // Get patrol NPC properties
             PatrolProperties properties = PatrolDict.get(npc);
@@ -102,44 +116,67 @@ public final class EventfulMain extends JavaPlugin {
                 PatrolDict.put(npc, properties);
             }
 
-            // Find the closest player
-            var minDist = 99999.0;
-            Player closestPlayer = null;
-            for (var player : Bukkit.getOnlinePlayers()) {
-                var dist = player.getPlayer().getLocation().distance(npcEntity.getLocation());
-                if (dist > minDist) continue;
-                minDist = dist;
-                closestPlayer = player;
+            // Play corresponding animation
+            npc.data().set(NPC.Metadata.AGGRESSIVE, properties.isChasingPlayer);
+            NMS.setAggressive(npcEntity, properties.isChasingPlayer);
+
+            // If we lost track of the player, return back to normal
+            var hasLostPlayer = (System.currentTimeMillis() - properties.lastTimeSincePlayerWasSeen) > 5000;
+            if (hasLostPlayer) {
+                if (properties.lastKnownPlayerLocation != null) {
+                    properties.isChasingPlayer = false;
+                    GetLogger().info("lost the player :[");
+                }
+                properties.lastKnownPlayerLocation = null;
             }
-            if (closestPlayer == null) continue;
 
             // << Here is the meat of the chase routine >> //
+            var closestPlayer = (Player) getClosestEntity(npcEntity, EntityType.PLAYER, "");
 
             // Check if the NPC can see the player
-            var world = closestPlayer.getWorld();
-            var playerDir = closestPlayer.getEyeLocation().subtract(npcEntity.getEyeLocation()).toVector();
-            var traceResult = world.rayTraceBlocks(npcEntity.getEyeLocation(), playerDir, 100f);
-            if (traceResult != null && traceResult.getHitBlock() == null) { // This means it has direct line of sight with the player
-                properties.susLevel = Math.min(properties.susLevel + 0.01f, 1); // Takes 5 seconds to max out the sus meter
-                GetLogger().log(Level.INFO, properties.susLevel + "");
-                if (properties.susLevel >= 1) {
-                    properties.lastKnownPlayerLocation = closestPlayer.getLocation();
+            if (closestPlayer != null && closestPlayer.getGameMode().equals(GameMode.SURVIVAL) && npcEntity.hasLineOfSight(closestPlayer)) {
+                var playerDistance = npcEntity.getLocation().distance(closestPlayer.getLocation());
+                var playerBlock = closestPlayer.getWorld().getBlockAt(closestPlayer.getLocation().toBlockLocation());
+                GetLogger().info(String.valueOf(playerBlock.getLightLevel()));
+
+                if (playerDistance < 10) {
+                    var npcDirection = npcEntity.getLocation().getDirection().normalize();
+                    var playerVector = closestPlayer.getLocation().toVector().subtract(npcEntity.getLocation().toVector()).normalize();
+                    var angleDegrees = Math.acos(npcDirection.dot(playerVector)) * 180 / Math.PI;
+
+                    if (angleDegrees <= 60) {
+                        properties.lastKnownPlayerLocation = closestPlayer.getLocation();
+                        properties.lastTimeSincePlayerWasSeen = System.currentTimeMillis();
+                        properties.isChasingPlayer = true;
+                    }
+                    else if (properties.isChasingPlayer) {
+                        properties.lastKnownPlayerLocation = closestPlayer.getLocation();
+                    }
+
+                    // Do damage to the player (if its close enough)
+                    if (playerDistance < 1.5 && (System.currentTimeMillis() - properties.lastAttackTimer) > 1000) {
+                        npcEntity.swingMainHand();
+                        npcEntity.attack(closestPlayer);
+                        properties.lastAttackTimer = System.currentTimeMillis();
+                    }
                 }
             }
 
-            // Check for audio entities near the npc
-            minDist = 99999.0;
-            Entity closestSoundEntity = null;
-            for (var entity : npcEntity.getNearbyEntities(16, 16, 16)) {
-                if (!entity.getScoreboardTags().contains("audio")) continue; // Check for the "audio" tag
-                var dist = entity.getLocation().distance(npcEntity.getLocation());
-                if (dist > minDist) continue;
-                minDist = dist;
-                closestSoundEntity = entity;
+            // Check for sound entities near the npc
+            properties.closestSoundLocation = null;
+            Entity closestSoundEntity = getClosestEntity(npcEntity, EntityType.ARMOR_STAND, "sound");
+            if (closestSoundEntity != null && closestSoundEntity.getScoreboardTags().size() > 1) {
+                var maxDistanceBlocks = (String) closestSoundEntity.getScoreboardTags().toArray()[0];
+                var soundDistance = npcEntity.getLocation().distance(closestSoundEntity.getLocation());
+                if (StringUtils.isNumeric(maxDistanceBlocks) && Integer.parseInt(maxDistanceBlocks) <= soundDistance) {
+                    properties.closestSoundLocation = closestSoundEntity.getLocation();
+                }
             }
-            if (closestSoundEntity != null)  {
-                properties.closestSoundLocation = closestSoundEntity.getLocation();
-            }
+
+            // Check for target entities near the npc
+            Entity closestTargetEntity = getClosestEntity(npcEntity, EntityType.ARMOR_STAND, npc.getName() + ".target");
+            properties.closestTargetLocation = (closestTargetEntity == null) ? null : closestTargetEntity.getLocation();
+
 
             float speedModifier = 1f;
             Location targetLocation = null;
@@ -154,14 +191,41 @@ public final class EventfulMain extends JavaPlugin {
                 speedModifier = 1.4f;
                 targetLocation = properties.lastKnownPlayerLocation;
             }
+            // Else if there's a target present
+            else if (properties.closestTargetLocation != null) {
+                speedModifier = 1f;
+                targetLocation = properties.closestTargetLocation;
+            }
 
             // Move towards the target location
-            if (properties.closestSoundLocation != null && properties.lastKnownPlayerLocation != null) {
+            if (targetLocation != null) {
                 npc.getNavigator().setTarget(targetLocation);
                 npc.getNavigator().getLocalParameters().range(500);
                 npc.getNavigator().getLocalParameters().speedModifier(speedModifier);
-                npc.getNavigator().getLocalParameters().pathDistanceMargin(0.1f);
+            }
+            else { // Else, we are following waypoints
+                npc.getNavigator().getLocalParameters().speedModifier(speedModifier);
             }
         }
+    }
+
+    public static Entity getClosestEntity(Entity entity, EntityType entityType, String tag) {
+        var minDistance = Double.MAX_VALUE;
+        Entity closestEntity = null;
+        var nearbyEntities = entity.getNearbyEntities(50, 50, 50);
+        for (Entity e : nearbyEntities) {
+            if (!tag.isEmpty() && !e.getScoreboardTags().contains(tag)) {
+                continue;
+            }
+            if (e.getType() != entityType) {
+                continue;
+            }
+            var curDistance = e.getLocation().distance(entity.getLocation());
+            if (curDistance < minDistance) {
+                minDistance = curDistance;
+                closestEntity = e;
+            }
+        }
+        return closestEntity;
     }
 }
